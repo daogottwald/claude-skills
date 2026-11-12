@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Grep every completed job log of a try push for a regex.
+
+Usage: try-grep-logs PUSH_ID REGEX [--name NAME_REGEX] [--failed-only] [--threads N]
+Prints distinct matching lines (after stripping the log's PID/timestamp prefix)
+with the count of jobs each appeared in and one example job name.
+"""
+import json, re, sys, argparse, urllib.request, collections
+from concurrent.futures import ThreadPoolExecutor
+
+ap = argparse.ArgumentParser()
+ap.add_argument("push_id")
+ap.add_argument("regex")
+ap.add_argument("--name", default=None)
+ap.add_argument("--failed-only", action="store_true")
+ap.add_argument("--threads", type=int, default=8)
+a = ap.parse_args()
+pat = re.compile(a.regex)
+name_pat = re.compile(a.name) if a.name else None
+
+url = f"https://treeherder.mozilla.org/api/project/try/jobs/?push_id={a.push_id}&count=2000&offset=0"
+d = json.load(urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "try-grep-logs"})))
+jobs = []
+for r in d["results"]:
+    n = r["job_type_name"]
+    if r["state"] != "completed" or not r["task_id"]:
+        continue
+    if name_pat and not name_pat.search(n):
+        continue
+    if a.failed_only and r["result"] not in ("testfailed", "busted", "exception"):
+        continue
+    if n.startswith(("build-", "source-test", "toolchain", "fetch", "docker")):
+        continue
+    jobs.append((f'{r["platform"]}/{r["platform_option"]} {n}', r["task_id"], r["retry_id"]))
+
+prefix = re.compile(r"^.*?(GECKO\(\d+\)|PID \d+) \| ")
+def scan(job):
+    name, tid, rid = job
+    lines = set()
+    try:
+        resp = urllib.request.urlopen(
+            f"https://firefoxci.taskcluster-artifacts.net/{tid}/{rid}/public/logs/live_backing.log", timeout=300)
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").rstrip("\n")
+            if pat.search(line):
+                lines.add(prefix.sub("", line))
+    except Exception as e:
+        print(f"ERR {name} {tid}: {e}", file=sys.stderr)
+    return name, lines
+
+hits = collections.defaultdict(list)
+with ThreadPoolExecutor(a.threads) as ex:
+    for name, lines in ex.map(scan, jobs):
+        for l in lines:
+            hits[l].append(name)
+print(f"# scanned {len(jobs)} jobs, {len(hits)} distinct lines", file=sys.stderr)
+for l, names in sorted(hits.items(), key=lambda kv: -len(kv[1])):
+    print(f"[{len(names)} job(s), e.g. {names[0]}]\n{l}\n")
